@@ -55,10 +55,27 @@
   </section>
 </main>
 
-<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script>
+  // Loads the QR library, trying three CDNs in turn if one is blocked or slow
+  (function () {
+    var urls = [
+      'https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js',
+      'https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js',
+      'https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js'
+    ], i = 0;
+    function next() {
+      if (i >= urls.length) return;
+      var s = document.createElement('script');
+      s.src = urls[i++];
+      s.onerror = function () { s.remove(); next(); };
+      document.head.appendChild(s);
+    }
+    next();
+  })();
+</script>
 <script>
   // Paste the Apps Script Web app URL (ends with /exec). Optional: open this page with ?p=PROGRAMKEY to preselect a program.
-  const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwztWr_Tv9fUjjtboU-BM_gXTuHjipzB_dzDJb6oMDsd4mY1HlmIdP3UzpYrIwicj544w/exec';
+  const SCRIPT_URL = 'PASTE_YOUR_WEB_APP_URL_HERE';
 
   const $ = (id) => document.getElementById(id);
   const ls = {
@@ -165,6 +182,7 @@
     show('', 'Loading ticket list...', '');
     const ok = await loadManifest();
     if (ok === false) return;
+    if (typeof Html5Qrcode === 'undefined') return show('err', 'QR library did not load', 'Check the internet and reload the page. You can still type the ticket ID below.');
     scanner = scanner || new Html5Qrcode('reader');
     try {
       await scanner.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 240, height: 240 } }, onScan, () => {});
@@ -179,6 +197,7 @@
     let list = [];
     try { list = (await api({ action: 'programs' })).list || []; ls.set('progs', list); } catch (e) { list = ls.get('progs', []); }
     $('prog').innerHTML = '';
+    if (!list.length) show('err', 'Cannot load programs', 'Check SCRIPT_URL, that web app access is Anyone, and the internet connection.');
     list.forEach((x) => { const o = document.createElement('option'); o.value = x.key; o.textContent = x.name; $('prog').append(o); });
     if (want) $('prog').value = want;
     $('who').value = prefs.who || ''; $('pin').value = prefs.pin || '';
