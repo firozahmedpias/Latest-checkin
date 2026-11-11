@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Check-in scanner</title>
+<style>
+  :root{--bg:#eef1f5;--panel:#fff;--text:#14181f;--muted:#5d6675;--line:#d5dae3;--accent:#1b4fd8;--on:#fff;--ok:#0f8a4b;--warn:#b36b00;--err:#c62f26;--info:#1b4fd8;--idle:#3b4558}
+  @media (prefers-color-scheme:dark){:root{--bg:#0f1218;--panel:#181d27;--text:#eef1f6;--muted:#96a0b2;--line:#2b3342;--accent:#6d94ff;--on:#0b1020;--ok:#1fa862;--warn:#c98a1a;--err:#e0463c;--info:#3d6be0;--idle:#2b3342}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:"Segoe UI",system-ui,-apple-system,Roboto,Arial,sans-serif;line-height:1.4;padding:env(safe-area-inset-top,0) 0 env(safe-area-inset-bottom,0)}
+  main{max-width:520px;margin:0 auto;padding:14px;display:grid;gap:12px}
+  .status{border-radius:14px;padding:20px 18px;background:var(--idle);color:#fff;min-height:118px;display:flex;flex-direction:column;justify-content:center;transition:background-color .15s}
+  .status.ok{background:var(--ok)}.status.warn{background:var(--warn)}.status.err{background:var(--err)}.status.info{background:var(--info)}
+  .status h1{font-size:1.7rem;line-height:1.15;margin:0 0 4px;overflow-wrap:anywhere}
+  .status p{margin:0;overflow-wrap:anywhere}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px}
+  #reader{width:100%;border-radius:8px;overflow:hidden;background:#000}
+  label{display:block;font-size:.9rem;color:var(--muted);margin:10px 0 4px}
+  input,select{width:100%;font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:12px}
+  button{font:inherit;font-weight:600;cursor:pointer;background:var(--accent);color:var(--on);border:0;border-radius:8px;padding:12px 18px;min-height:46px}
+  button.secondary{background:transparent;color:var(--text);border:1px solid var(--line)}
+  button.wide{width:100%;margin-top:12px}
+  :focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+  .row{display:grid;grid-template-columns:1fr auto;gap:8px}
+  .meta{display:flex;justify-content:space-between;margin:0 0 6px}
+  ul{list-style:none;margin:0;padding:0}
+  li{display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-top:1px solid var(--line);font-size:.95rem}
+  li:first-child{border-top:0}li span:first-child{color:var(--muted);white-space:nowrap}li span:last-child{text-align:right;overflow-wrap:anywhere}
+  li.ok span:last-child{color:var(--ok)}li.warn span:last-child{color:var(--warn)}li.err span:last-child{color:var(--err)}li.info span:last-child{color:var(--info)}
+</style>
+</head>
+<body>
+<main>
+  <section class="status" id="status" aria-live="polite"><h1 id="sT">Ready to scan</h1><p id="sD">Choose the program, enter the PIN, then start.</p></section>
+
+  <section class="panel">
+    <div id="reader"></div>
+    <label for="prog">Program</label><select id="prog"></select>
+    <label for="who">Your name (for the log)</label><input id="who" autocomplete="off">
+    <label for="pin">Staff PIN</label><input id="pin" type="password" inputmode="numeric" autocomplete="off">
+    <button id="toggle" class="wide">Start scanner</button>
+  </section>
+
+  <section class="panel">
+    <label for="manual" style="margin-top:0">QR not scanning? Type the ticket ID</label>
+    <div class="row"><input id="manual" autocapitalize="characters" autocomplete="off" placeholder="EVT-XXXXXX"><button id="manualBtn" class="secondary">Check in</button></div>
+  </section>
+
+  <section class="panel">
+    <p class="meta"><span>Checked in on this phone</span><strong id="count">0</strong></p>
+    <p class="meta"><span>Waiting to sync</span><strong id="pend">0</strong></p>
+    <p class="meta"><span>Present / registered (all phones)</span><strong id="stat">-</strong></p>
+    <ul id="history"></ul>
+  </section>
+</main>
+
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script>
+  // Paste the Apps Script Web app URL (ends with /exec). Optional: open this page with ?p=PROGRAMKEY to preselect a program.
+  const SCRIPT_URL = 'PASTE_YOUR_WEB_APP_URL_HERE';
+
+  const $ = (id) => document.getElementById(id);
+  const ls = {
+    get: (k, d) => { try { const v = JSON.parse(localStorage.getItem(k)); return v == null ? d : v; } catch (e) { return d; } },
+    set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+  };
+  const buzz = (p) => { if (navigator.vibrate) navigator.vibrate(p); };
+  const P = () => $('prog').value;
+  let M = {}, Q = [], scanner = null, running = false, busy = false, flushing = false, last = '', lastT = 0, count = 0;
+
+  function show(k, t, d) { $('status').className = 'status ' + k; $('sT').textContent = t; $('sD').textContent = d || ''; }
+  function hist(k, label) {
+    const li = document.createElement('li'); li.className = k;
+    const a = document.createElement('span'); a.textContent = new Date().toLocaleTimeString();
+    const b = document.createElement('span'); b.textContent = label;
+    li.append(a, b); $('history').prepend(li);
+    while ($('history').children.length > 8) $('history').lastChild.remove();
+  }
+
+  function stats() {
+    const v = Object.keys(M).map((k) => M[k]);
+    $('stat').textContent = v.filter((e) => e[1]).length + ' / ' + v.filter((e) => e[0]).length;
+  }
+
+  async function api(o, ms) {
+    const c = new AbortController(), t = setTimeout(() => c.abort(), ms || 7000);
+    const q = new URLSearchParams(Object.assign({ p: P(), key: $('pin').value.trim(), d: $('who').value.trim() }, o));
+    try { return await (await fetch(SCRIPT_URL + '?' + q, { signal: c.signal })).json(); }
+    finally { clearTimeout(t); }
+  }
+
+  function parseId(s) {
+    s = s.trim();
+    try { const u = new URL(s); return (u.searchParams.get('id') || u.pathname.split('/').pop()).toUpperCase(); }
+    catch (e) { return s.toUpperCase(); }
+  }
+
+  async function loadManifest() {
+    try {
+      const d = await api({ action: 'manifest' }, 15000);
+      if (d.status !== 'ok') { show('err', d.message || 'Error', ''); return false; }
+      M = d.m; ls.set('m_' + P(), M); stats(); return true;
+    } catch (e) { M = ls.get('m_' + P(), {}); stats(); return null; }
+  }
+
+  function result(d, id) {
+    if (d.status === 'ok') {
+      count++; $('count').textContent = count; M[id] = [d.name, d.time];
+      show('ok', 'Welcome, ' + d.name + '!', 'Checked in at ' + d.time); hist('ok', d.name); buzz(80);
+    } else if (d.status === 'duplicate') {
+      M[id] = [d.name, d.time];
+      show('warn', 'Already checked in', d.name + ' - first scan ' + d.time); hist('warn', d.name + ' (again)'); buzz([100, 60, 100]);
+    } else if (d.status === 'unregistered') {
+      show('err', 'Ticket not registered', 'Send to the registration desk - ' + id); hist('err', id + ' not registered'); buzz(300);
+    } else if (d.status === 'invalid') {
+      show('err', 'Invalid ticket', id); hist('err', id + ' invalid'); buzz(300);
+    } else { show('err', d.message || 'Something went wrong', id); }
+  }
+
+  function offline(id, e) {
+    if (e && !e[0]) { show('err', 'Not registered (offline check)', 'Send to the registration desk - ' + id); hist('err', id + ' not registered'); return; }
+    Q.push({ id: id, t: Date.now() }); ls.set('q_' + P(), Q); $('pend').textContent = Q.length;
+    const n = e ? e[0] : 'ticket ' + id;
+    if (e) M[id] = [e[0], 'pending sync'];
+    show('info', 'Saved offline: ' + n, 'Will sync when the connection returns'); hist('info', n + ' (offline)'); buzz(80);
+  }
+
+  async function checkIn(raw) {
+    const id = parseId(raw), e = M[id];
+    if (Object.keys(M).length && !e) return result({ status: 'invalid' }, id);
+    if (e && e[1]) return result({ status: 'duplicate', name: e[0], time: e[1] }, id);
+    show('', 'Checking...', id);
+    try { result(await api({ id: id }), id); stats(); flush(); }
+    catch (err) { offline(id, e); }
+  }
+
+  async function flush() {
+    if (flushing || !Q.length) return;
+    flushing = true;
+    try {
+      while (Q.length) {
+        const it = Q[0], d = await api({ id: it.id, t: it.t }, 10000);
+        if (d.status === 'error') break;
+        Q.shift(); ls.set('q_' + P(), Q);
+        if (d.status === 'ok' || d.status === 'duplicate') M[it.id] = [d.name, d.time];
+      }
+    } catch (e) {}
+    flushing = false; $('pend').textContent = Q.length;
+  }
+
+  function onScan(text) {
+    const now = Date.now();
+    if (busy || (text === last && now - lastT < 4000)) return;
+    busy = true; last = text; lastT = now;
+    checkIn(text).finally(() => setTimeout(() => { busy = false; }, 1000));
+  }
+
+  async function toggle() {
+    if (running) { await scanner.stop(); running = false; $('toggle').textContent = 'Start scanner'; return; }
+    if (SCRIPT_URL.indexOf('PASTE_') === 0) return show('err', 'Scanner not set up', 'Add your Web app URL to SCRIPT_URL in this file.');
+    if (!P() || !$('pin').value.trim()) return show('err', 'Choose a program and enter the PIN', '');
+    ls.set('prefs', { p: P(), who: $('who').value, pin: $('pin').value });
+    Q = ls.get('q_' + P(), []); $('pend').textContent = Q.length;
+    show('', 'Loading ticket list...', '');
+    const ok = await loadManifest();
+    if (ok === false) return;
+    scanner = scanner || new Html5Qrcode('reader');
+    try {
+      await scanner.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 240, height: 240 } }, onScan, () => {});
+      running = true; $('toggle').textContent = 'Stop scanner';
+      show(ok ? '' : 'info', ok ? 'Scanning' : 'Offline mode', ok ? 'Hold a QR code in front of the camera.' : 'Using the saved ticket list. Scans will sync later.');
+      flush();
+    } catch (e) { show('err', 'Camera not available', 'Allow camera permission, and open this page over https.'); }
+  }
+
+  async function init() {
+    const prefs = ls.get('prefs', {}), want = new URLSearchParams(location.search).get('p') || prefs.p;
+    let list = [];
+    try { list = (await api({ action: 'programs' })).list || []; ls.set('progs', list); } catch (e) { list = ls.get('progs', []); }
+    $('prog').innerHTML = '';
+    list.forEach((x) => { const o = document.createElement('option'); o.value = x.key; o.textContent = x.name; $('prog').append(o); });
+    if (want) $('prog').value = want;
+    $('who').value = prefs.who || ''; $('pin').value = prefs.pin || '';
+  }
+
+  $('toggle').addEventListener('click', toggle);
+  $('manualBtn').addEventListener('click', () => { const v = $('manual').value.trim(); if (v) { checkIn(v); $('manual').value = ''; } });
+  $('manual').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('manualBtn').click(); });
+  setInterval(flush, 15000);
+  setInterval(() => { if (running && !Q.length && !busy) loadManifest(); }, 60000);
+  if (SCRIPT_URL.indexOf('PASTE_') !== 0) init();
+</script>
+</body>
+</html>
